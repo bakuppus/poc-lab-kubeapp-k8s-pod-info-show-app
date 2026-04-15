@@ -1,0 +1,173 @@
+name: Release image & bump Helm values
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/kubeapp
+  CHART_VALUES_FILE: helm-chart/values.yaml
+  BASE_BRANCH: dev
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Derive tag from ref
+        id: vars
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.vars.outputs.tag }}
+            type=sha,format=short
+
+      - name: Build and push (multi-arch)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  bump-helm:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install yq
+        uses: mikefarah/yq@v4.44.3
+
+      - name: Show BEFORE (debug)
+        run: |
+          echo "---- BEFORE ----"
+          sed -n '1,200p' "${{ env.CHART_VALUES_FILE }}" || true
+
+      - name: Update Helm values.yaml (repo + tag + digest)
+        id: bump
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          TAG: ${{ needs.build-and-push.outputs.image-tag }}
+          DIGEST: ${{ needs.build-and-push.outputs.image-digest }}
+        run: |
+          set -euo pipefail
+          FILE="${CHART_VALUES_FILE}"
+
+          echo "yq version: $(yq --version || true)"
+
+          # --- Step 0: One-time cleanup ---
+          sed -i 's#^[[:space:]]*repository:[[:space:]]*docker[[:space:]]\+pull[[:space:]]\+#repository: #g' "$FILE"
+
+          # --- Step 1: Ensure .image exists ---
+          if ! yq e '.image' "$FILE" >/dev/null 2>&1; then
+            yq e '.image = {}' -i "$FILE"
+          fi
+
+          # --- Step 2: Ensure subkeys exist ---
+          for key in repository tag pullPolicy digest; do
+            if ! yq e ".image.$key" "$FILE" >/dev/null 2>&1; then
+              yq e ".image.$key = \"\"" -i "$FILE"
+            fi
+          done
+
+          # --- Step 3: Set clean values ---
+          yq e ".image.repository = strenv(IMAGE_NAME)" -i "$FILE"
+          yq e ".image.tag = strenv(TAG)" -i "$FILE"
+          yq e ".image.pullPolicy = \"IfNotPresent\"" -i "$FILE"
+          yq e ".image.digest = strenv(DIGEST)" -i "$FILE"
+
+          # --- Step 4: Final guard ---
+          REPO="$(yq e -r '.image.repository' "$FILE")"
+          if echo "$REPO" | grep -qE '(^docker[[:space:]]+pull|[[:space:]])'; then
+            echo "ERROR: .image.repository must be just the image reference, got: '$REPO'" >&2
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Show AFTER (debug)
+        run: |
+          echo "---- AFTER ----"
+          sed -n '1,200p' "${{ env.CHART_VALUES_FILE }}"
+
+      - name: Prepare branch and push changes
+        env:
+          BASE_BRANCH: ${{ env.BASE_BRANCH }}
+          CHART_VALUES_FILE: ${{ env.CHART_VALUES_FILE }}
+        run: |
+          set -euo pipefail
+
+          BASE="${BASE_BRANCH}"
+          BRANCH="chore/bump-helm-${{ steps.bump.outputs.tag }}"
+          FILE="${CHART_VALUES_FILE}"
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          # Ensure we base from latest BASE branch
+          git fetch origin "$BASE" --depth=1
+          git checkout -B "$BASE" "origin/$BASE"
+
+          # Create or update the chore branch
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH" --depth=1
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+            git rebase "origin/$BASE" || true
+          else
+            git checkout -b "$BRANCH"
+          fi
+
+          # Stage and commit only if changed
+          git add "$FILE"
+          if git diff --cached --quiet; then
+            echo "No changes to commit in $FILE (already up to date)."
+          else
+            git commit -m "chore(chart): bump image to ${{ steps.bump.outputs.tag }} @ ${{ steps.bump.outputs.digest }}"
+          fi
+
+          # Push branch
+          git push origin "$BRANCH"
